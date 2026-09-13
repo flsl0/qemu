@@ -25,15 +25,15 @@
 #include "qemu/osdep.h"
 
 #include "block/qdict.h"
-#include "sysemu/block-backend.h"
+#include "system/block-backend.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qcow2.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qapi/qapi-events-block-core.h"
-#include "qapi/qmp/qdict.h"
-#include "qapi/qmp/qstring.h"
+#include "qobject/qdict.h"
+#include "qobject/qstring.h"
 #include "trace.h"
 #include "qemu/option_int.h"
 #include "qemu/cutils.h"
@@ -321,7 +321,7 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             }
             s->crypto = qcrypto_block_open(s->crypto_opts, "encrypt.",
                                            qcow2_crypto_hdr_read_func,
-                                           bs, cflags, QCOW2_MAX_THREADS, errp);
+                                           bs, cflags, errp);
             if (!s->crypto) {
                 return -EINVAL;
             }
@@ -835,41 +835,113 @@ static const char *overlap_bool_option_names[QCOW2_OL_MAX_BITNR] = {
     [QCOW2_OL_BITMAP_DIRECTORY_BITNR] = QCOW2_OPT_OVERLAP_BITMAP_DIRECTORY,
 };
 
-static void cache_clean_timer_cb(void *opaque)
+static void coroutine_fn cache_clean_timer(void *opaque)
 {
-    BlockDriverState *bs = opaque;
-    BDRVQcow2State *s = bs->opaque;
-    qcow2_cache_clean_unused(s->l2_table_cache);
-    qcow2_cache_clean_unused(s->refcount_block_cache);
-    timer_mod(s->cache_clean_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (int64_t) s->cache_clean_interval * 1000);
+    BDRVQcow2State *s = opaque;
+    uint64_t wait_ns;
+
+    WITH_QEMU_LOCK_GUARD(&s->lock) {
+        wait_ns = s->cache_clean_interval * NANOSECONDS_PER_SECOND;
+    }
+
+    while (wait_ns > 0) {
+        qemu_co_sleep_ns_wakeable(&s->cache_clean_timer_wake,
+                                  QEMU_CLOCK_REALTIME, wait_ns);
+
+        WITH_QEMU_LOCK_GUARD(&s->lock) {
+            if (s->cache_clean_interval > 0) {
+                qcow2_cache_clean_unused(s->l2_table_cache);
+                qcow2_cache_clean_unused(s->refcount_block_cache);
+            }
+
+            wait_ns = s->cache_clean_interval * NANOSECONDS_PER_SECOND;
+        }
+    }
+
+    WITH_QEMU_LOCK_GUARD(&s->lock) {
+        s->cache_clean_timer_co = NULL;
+        qemu_co_queue_restart_all(&s->cache_clean_timer_exit);
+    }
 }
 
 static void cache_clean_timer_init(BlockDriverState *bs, AioContext *context)
 {
     BDRVQcow2State *s = bs->opaque;
     if (s->cache_clean_interval > 0) {
-        s->cache_clean_timer =
-            aio_timer_new_with_attrs(context, QEMU_CLOCK_VIRTUAL,
-                                     SCALE_MS, QEMU_TIMER_ATTR_EXTERNAL,
-                                     cache_clean_timer_cb, bs);
-        timer_mod(s->cache_clean_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-                  (int64_t) s->cache_clean_interval * 1000);
+        assert(!s->cache_clean_timer_co);
+        s->cache_clean_timer_co = qemu_coroutine_create(cache_clean_timer, s);
+        aio_co_enter(context, s->cache_clean_timer_co);
     }
 }
 
-static void cache_clean_timer_del(BlockDriverState *bs)
+/**
+ * Delete the cache clean timer and await any yet running instance.
+ * Called holding s->lock.
+ */
+static void coroutine_fn
+cache_clean_timer_co_locked_del_and_wait(BlockDriverState *bs)
 {
     BDRVQcow2State *s = bs->opaque;
-    if (s->cache_clean_timer) {
-        timer_free(s->cache_clean_timer);
-        s->cache_clean_timer = NULL;
+
+    if (s->cache_clean_timer_co) {
+        s->cache_clean_interval = 0;
+        qemu_co_sleep_wake(&s->cache_clean_timer_wake);
+        qemu_co_queue_wait(&s->cache_clean_timer_exit, &s->lock);
+    }
+}
+
+/**
+ * Same as cache_clean_timer_co_locked_del_and_wait(), but takes s->lock.
+ */
+static void coroutine_fn
+cache_clean_timer_co_del_and_wait(BlockDriverState *bs)
+{
+    BDRVQcow2State *s = bs->opaque;
+
+    WITH_QEMU_LOCK_GUARD(&s->lock) {
+        cache_clean_timer_co_locked_del_and_wait(bs);
+    }
+}
+
+struct CacheCleanTimerDelAndWaitCoParams {
+    BlockDriverState *bs;
+    bool done;
+};
+
+static void coroutine_fn cache_clean_timer_del_and_wait_co_entry(void *opaque)
+{
+    struct CacheCleanTimerDelAndWaitCoParams *p = opaque;
+
+    cache_clean_timer_co_del_and_wait(p->bs);
+    p->done = true;
+    aio_wait_kick();
+}
+
+/**
+ * Delete the cache clean timer and await any yet running instance.
+ * Must be called from the main or BDS AioContext without s->lock held.
+ */
+static void coroutine_mixed_fn
+cache_clean_timer_del_and_wait(BlockDriverState *bs)
+{
+    IO_OR_GS_CODE();
+
+    if (qemu_in_coroutine()) {
+        cache_clean_timer_co_del_and_wait(bs);
+    } else {
+        struct CacheCleanTimerDelAndWaitCoParams p = { .bs = bs };
+        Coroutine *co;
+
+        co = qemu_coroutine_create(cache_clean_timer_del_and_wait_co_entry, &p);
+        qemu_coroutine_enter(co);
+
+        BDRV_POLL_WHILE(bs, !p.done);
     }
 }
 
 static void qcow2_detach_aio_context(BlockDriverState *bs)
 {
-    cache_clean_timer_del(bs);
+    cache_clean_timer_del_and_wait(bs);
 }
 
 static void qcow2_attach_aio_context(BlockDriverState *bs,
@@ -1214,11 +1286,23 @@ fail:
     return ret;
 }
 
+/* s_locked specifies whether s->lock is held or not */
 static void qcow2_update_options_commit(BlockDriverState *bs,
-                                        Qcow2ReopenState *r)
+                                        Qcow2ReopenState *r,
+                                        bool s_locked)
 {
     BDRVQcow2State *s = bs->opaque;
     int i;
+
+    /*
+     * We need to stop the cache-clean-timer before destroying the metadata
+     * table caches
+     */
+    if (s_locked) {
+        cache_clean_timer_co_locked_del_and_wait(bs);
+    } else {
+        cache_clean_timer_del_and_wait(bs);
+    }
 
     if (s->l2_table_cache) {
         qcow2_cache_destroy(s->l2_table_cache);
@@ -1228,6 +1312,7 @@ static void qcow2_update_options_commit(BlockDriverState *bs,
     }
     s->l2_table_cache = r->l2_table_cache;
     s->refcount_block_cache = r->refcount_block_cache;
+
     s->l2_slice_size = r->l2_slice_size;
 
     s->overlap_check = r->overlap_check;
@@ -1239,11 +1324,8 @@ static void qcow2_update_options_commit(BlockDriverState *bs,
 
     s->discard_no_unref = r->discard_no_unref;
 
-    if (s->cache_clean_interval != r->cache_clean_interval) {
-        cache_clean_timer_del(bs);
-        s->cache_clean_interval = r->cache_clean_interval;
-        cache_clean_timer_init(bs, bdrv_get_aio_context(bs));
-    }
+    s->cache_clean_interval = r->cache_clean_interval;
+    cache_clean_timer_init(bs, bdrv_get_aio_context(bs));
 
     qapi_free_QCryptoBlockOpenOptions(s->crypto_opts);
     s->crypto_opts = r->crypto_opts;
@@ -1261,6 +1343,7 @@ static void qcow2_update_options_abort(BlockDriverState *bs,
     qapi_free_QCryptoBlockOpenOptions(r->crypto_opts);
 }
 
+/* Called with s->lock held */
 static int coroutine_fn GRAPH_RDLOCK
 qcow2_update_options(BlockDriverState *bs, QDict *options, int flags,
                      Error **errp)
@@ -1270,7 +1353,7 @@ qcow2_update_options(BlockDriverState *bs, QDict *options, int flags,
 
     ret = qcow2_update_options_prepare(bs, &r, options, flags, errp);
     if (ret >= 0) {
-        qcow2_update_options_commit(bs, &r);
+        qcow2_update_options_commit(bs, &r, true);
     } else {
         qcow2_update_options_abort(bs, &r);
     }
@@ -1636,7 +1719,22 @@ qcow2_do_open(BlockDriverState *bs, QDict *options, int flags,
         goto fail;
     }
 
-    if (open_data_file) {
+    if (open_data_file && (flags & BDRV_O_NO_IO)) {
+        /*
+         * Don't open the data file for 'qemu-img info' so that it can be used
+         * to verify that an untrusted qcow2 image doesn't refer to external
+         * files.
+         *
+         * Note: This still makes has_data_file() return true.
+         */
+        if (s->incompatible_features & QCOW2_INCOMPAT_DATA_FILE) {
+            s->data_file = NULL;
+        } else {
+            s->data_file = bs->file;
+        }
+        qdict_extract_subqdict(options, NULL, "data-file.");
+        qdict_del(options, "data-file");
+    } else if (open_data_file) {
         /* Open external data file */
         bdrv_graph_co_rdunlock();
         s->data_file = bdrv_co_open_child(NULL, options, "data-file", bs,
@@ -1701,13 +1799,12 @@ qcow2_do_open(BlockDriverState *bs, QDict *options, int flags,
                 cflags |= QCRYPTO_BLOCK_OPEN_NO_IO;
             }
             s->crypto = qcrypto_block_open(s->crypto_opts, "encrypt.",
-                                           NULL, NULL, cflags,
-                                           QCOW2_MAX_THREADS, errp);
+                                           NULL, NULL, cflags, errp);
             if (!s->crypto) {
                 ret = -EINVAL;
                 goto fail;
             }
-        } else if (!(flags & BDRV_O_NO_IO)) {
+        } else {
             error_setg(errp, "Missing CRYPTO header for crypt method %d",
                        s->crypt_method_header);
             ret = -EINVAL;
@@ -1881,7 +1978,9 @@ qcow2_do_open(BlockDriverState *bs, QDict *options, int flags,
     g_free(s->image_data_file);
     if (open_data_file && has_data_file(bs)) {
         bdrv_graph_co_rdunlock();
+        bdrv_drain_all_begin();
         bdrv_co_unref_child(bs, s->data_file);
+        bdrv_drain_all_end();
         bdrv_graph_co_rdlock();
         s->data_file = NULL;
     }
@@ -1892,7 +1991,7 @@ qcow2_do_open(BlockDriverState *bs, QDict *options, int flags,
     qemu_vfree(s->l1_table);
     /* else pre-write overlap checks in cache_destroy may crash */
     s->l1_table = NULL;
-    cache_clean_timer_del(bs);
+    cache_clean_timer_co_locked_del_and_wait(bs);
     if (s->l2_table_cache) {
         qcow2_cache_destroy(s->l2_table_cache);
     }
@@ -1947,6 +2046,7 @@ static int qcow2_open(BlockDriverState *bs, QDict *options, int flags,
 
     /* Initialise locks */
     qemu_co_mutex_init(&s->lock);
+    qemu_co_queue_init(&s->cache_clean_timer_exit);
 
     assert(!qemu_in_coroutine());
     assert(qemu_get_current_aio_context() == qemu_get_aio_context());
@@ -1962,7 +2062,7 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
 {
     BDRVQcow2State *s = bs->opaque;
 
-    if (bs->encrypted) {
+    if (s->crypto) {
         /* Encryption works on a sector granularity */
         bs->bl.request_alignment = qcrypto_block_get_sector_size(s->crypto);
     }
@@ -2032,7 +2132,7 @@ static void qcow2_reopen_commit(BDRVReopenState *state)
 
     GRAPH_RDLOCK_GUARD_MAINLOOP();
 
-    qcow2_update_options_commit(state->bs, state->opaque);
+    qcow2_update_options_commit(state->bs, state->opaque, false);
     if (!s->data_file) {
         /*
          * If we don't have an external data file, s->data_file was cleared by
@@ -2127,9 +2227,9 @@ static void qcow2_join_options(QDict *options, QDict *old_options)
 }
 
 static int coroutine_fn GRAPH_RDLOCK
-qcow2_co_block_status(BlockDriverState *bs, bool want_zero, int64_t offset,
-                      int64_t count, int64_t *pnum, int64_t *map,
-                      BlockDriverState **file)
+qcow2_co_block_status(BlockDriverState *bs, unsigned int mode,
+                      int64_t offset, int64_t count, int64_t *pnum,
+                      int64_t *map, BlockDriverState **file)
 {
     BDRVQcow2State *s = bs->opaque;
     uint64_t host_offset;
@@ -2789,7 +2889,7 @@ qcow2_do_close(BlockDriverState *bs, bool close_data_file)
         qcow2_inactivate(bs);
     }
 
-    cache_clean_timer_del(bs);
+    cache_clean_timer_del_and_wait(bs);
     qcow2_cache_destroy(s->l2_table_cache);
     qcow2_cache_destroy(s->refcount_block_cache);
 
@@ -2807,7 +2907,7 @@ qcow2_do_close(BlockDriverState *bs, bool close_data_file)
     if (close_data_file && has_data_file(bs)) {
         GLOBAL_STATE_CODE();
         bdrv_graph_rdunlock_main_loop();
-        bdrv_graph_wrlock();
+        bdrv_graph_wrlock_drained();
         bdrv_unref_child(bs, s->data_file);
         bdrv_graph_wrunlock();
         s->data_file = NULL;
@@ -2857,6 +2957,9 @@ qcow2_co_invalidate_cache(BlockDriverState *bs, Error **errp)
     data_file = s->data_file;
     memset(s, 0, sizeof(BDRVQcow2State));
     s->data_file = data_file;
+    /* Re-initialize objects initialized in qcow2_open() */
+    qemu_co_mutex_init(&s->lock);
+    qemu_co_queue_init(&s->cache_clean_timer_exit);
 
     options = qdict_clone_shallow(bs->options);
 
@@ -3200,10 +3303,10 @@ qcow2_set_up_encryption(BlockDriverState *bs,
     int fmt, ret;
 
     switch (cryptoopts->format) {
-    case Q_CRYPTO_BLOCK_FORMAT_LUKS:
+    case QCRYPTO_BLOCK_FORMAT_LUKS:
         fmt = QCOW_CRYPT_LUKS;
         break;
-    case Q_CRYPTO_BLOCK_FORMAT_QCOW:
+    case QCRYPTO_BLOCK_FORMAT_QCOW:
         fmt = QCOW_CRYPT_AES;
         break;
     default:
@@ -3888,6 +3991,8 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
     BlockDriverState *bs = NULL;
     BlockDriverState *data_bs = NULL;
     const char *val;
+    bool keep_data_file = false;
+    BlockdevCreateOptionsQcow2 *qcow2_opts;
     int ret;
 
     /* Only the keyval visitor supports the dotted syntax needed for
@@ -3919,6 +4024,22 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
         qdict_put_str(qdict, BLOCK_OPT_COMPAT_LEVEL, "v3");
     }
 
+    val = qdict_get_try_str(qdict, BLOCK_OPT_KEEP_DATA_FILE);
+    if (val) {
+        if (!strcmp(val, "on")) {
+            keep_data_file = true;
+        } else if (!strcmp(val, "off")) {
+            keep_data_file = false;
+        } else {
+            error_setg(errp,
+                       "Invalid value '%s' for '%s': Must be 'on' or 'off'",
+                       val, BLOCK_OPT_KEEP_DATA_FILE);
+            ret = -EINVAL;
+            goto finish;
+        }
+        qdict_del(qdict, BLOCK_OPT_KEEP_DATA_FILE);
+    }
+
     /* Change legacy command line options into QMP ones */
     static const QDictRenames opt_renames[] = {
         { BLOCK_OPT_BACKING_FILE,       "backing-file" },
@@ -3940,7 +4061,7 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
     }
 
     /* Create and open the file (protocol layer) */
-    ret = bdrv_co_create_file(filename, opts, errp);
+    ret = bdrv_co_create_file(filename, opts, true, errp);
     if (ret < 0) {
         goto finish;
     }
@@ -3955,9 +4076,11 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
     /* Create and open an external data file (protocol layer) */
     val = qdict_get_try_str(qdict, BLOCK_OPT_DATA_FILE);
     if (val) {
-        ret = bdrv_co_create_file(val, opts, errp);
-        if (ret < 0) {
-            goto finish;
+        if (!keep_data_file) {
+            ret = bdrv_co_create_file(val, opts, false, errp);
+            if (ret < 0) {
+                goto finish;
+            }
         }
 
         data_bs = bdrv_co_open(val, NULL, NULL,
@@ -3970,6 +4093,11 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
 
         qdict_del(qdict, BLOCK_OPT_DATA_FILE);
         qdict_put_str(qdict, "data-file", data_bs->node_name);
+    } else if (keep_data_file) {
+        error_setg(errp, "Must not use '%s=on' without '%s'",
+                   BLOCK_OPT_KEEP_DATA_FILE, BLOCK_OPT_DATA_FILE);
+        ret = -EINVAL;
+        goto finish;
     }
 
     /* Set 'driver' and 'node' options */
@@ -3990,9 +4118,39 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
         goto finish;
     }
 
+    qcow2_opts = &create_options->u.qcow2;
+
+    if (!qcow2_opts->has_preallocation) {
+        qcow2_opts->preallocation = PREALLOC_MODE_OFF;
+    }
+
+    if (keep_data_file &&
+        qcow2_opts->preallocation != PREALLOC_MODE_OFF &&
+        qcow2_opts->preallocation != PREALLOC_MODE_METADATA)
+    {
+        error_setg(errp, "Preallocating more than only metadata would "
+                   "overwrite the external data file's content and is "
+                   "therefore incompatible with '%s=on'",
+                   BLOCK_OPT_KEEP_DATA_FILE);
+        ret = -EINVAL;
+        goto finish;
+    }
+
+    if (keep_data_file &&
+        qcow2_opts->preallocation == PREALLOC_MODE_OFF &&
+        !qcow2_opts->data_file_raw)
+    {
+        error_setg(errp, "'%s=on' requires '%s=metadata' or '%s=on', or the "
+                   "file contents will not be visible",
+                   BLOCK_OPT_KEEP_DATA_FILE,
+                   BLOCK_OPT_PREALLOC,
+                   BLOCK_OPT_DATA_FILE_RAW);
+        ret = -EINVAL;
+        goto finish;
+    }
+
     /* Silently round up size */
-    create_options->u.qcow2.size = ROUND_UP(create_options->u.qcow2.size,
-                                            BDRV_SECTOR_SIZE);
+    qcow2_opts->size = ROUND_UP(qcow2_opts->size, BDRV_SECTOR_SIZE);
 
     /* Create the qcow2 image (format layer) */
     ret = qcow2_co_create(create_options, errp);
@@ -4000,7 +4158,9 @@ finish:
     if (ret < 0) {
         bdrv_graph_co_rdlock();
         bdrv_co_delete_file_noerr(bs);
-        bdrv_co_delete_file_noerr(data_bs);
+        if (!keep_data_file) {
+            bdrv_co_delete_file_noerr(data_bs);
+        }
         bdrv_graph_co_rdunlock();
     } else {
         ret = 0;
@@ -5285,17 +5445,17 @@ qcow2_get_specific_info(BlockDriverState *bs, Error **errp)
     } else {
         /* if this assertion fails, this probably means a new version was
          * added without having it covered here */
-        assert(false);
+        g_assert_not_reached();
     }
 
     if (encrypt_info) {
         ImageInfoSpecificQCow2Encryption *qencrypt =
             g_new(ImageInfoSpecificQCow2Encryption, 1);
         switch (encrypt_info->format) {
-        case Q_CRYPTO_BLOCK_FORMAT_QCOW:
+        case QCRYPTO_BLOCK_FORMAT_QCOW:
             qencrypt->format = BLOCKDEV_QCOW2_ENCRYPTION_FORMAT_AES;
             break;
-        case Q_CRYPTO_BLOCK_FORMAT_LUKS:
+        case QCRYPTO_BLOCK_FORMAT_LUKS:
             qencrypt->format = BLOCKDEV_QCOW2_ENCRYPTION_FORMAT_LUKS;
             qencrypt->u.luks = encrypt_info->u.luks;
             break;
@@ -5934,7 +6094,7 @@ static int coroutine_fn qcow2_co_amend(BlockDriverState *bs,
             return -EOPNOTSUPP;
         }
 
-        if (qopts->encrypt->format != Q_CRYPTO_BLOCK_FORMAT_LUKS) {
+        if (qopts->encrypt->format != QCRYPTO_BLOCK_FORMAT_LUKS) {
             error_setg(errp,
                        "Amend can't be used to change the qcow2 encryption format");
             return -EOPNOTSUPP;
@@ -6099,6 +6259,12 @@ static QemuOptsList qcow2_create_opts = {
             .help = "Compression method used for image cluster "        \
                     "compression",                                      \
             .def_value_str = "zlib"                                     \
+        },                                                              \
+        {                                                               \
+            .name = BLOCK_OPT_KEEP_DATA_FILE,                           \
+            .type = QEMU_OPT_BOOL,                                      \
+            .help = "Assume the external data file already exists and " \
+                    "do not overwrite it"                               \
         },
         QCOW_COMMON_OPTIONS,
         { /* end of list */ }

@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
+#include "stm32l4x5.h"
 
 #define GPIO_BASE_ADDR 0x48000000
 #define GPIO_SIZE      0x400
@@ -43,6 +44,9 @@
 #define OTYPER_PUSH_PULL 0
 #define OTYPER_OPEN_DRAIN 1
 
+/* SoC forwards GPIOs to SysCfg */
+#define SYSCFG "/machine/soc"
+
 const uint32_t moder_reset[NUM_GPIOS] = {
     0xABFFFFFF,
     0xFFFFFEBF,
@@ -75,6 +79,17 @@ const uint32_t idr_reset[NUM_GPIOS] = {
     0x00000000,
     0x00000000
 };
+
+#define PIN_MASK        0xF
+#define GPIO_ADDR_MASK  (~(GPIO_SIZE - 1))
+
+static inline void *test_data(uint32_t gpio_addr, uint8_t pin)
+{
+    return (void *)(uintptr_t)((gpio_addr & GPIO_ADDR_MASK) | (pin & PIN_MASK));
+}
+
+#define test_gpio_addr(data)      ((uintptr_t)(data) & GPIO_ADDR_MASK)
+#define test_pin(data)            ((uintptr_t)(data) & PIN_MASK)
 
 static uint32_t gpio_readl(unsigned int gpio, unsigned int offset)
 {
@@ -154,14 +169,6 @@ static uint32_t reset(uint32_t gpio, unsigned int offset)
     return 0x0;
 }
 
-static void system_reset(void)
-{
-    QDict *r;
-    r = qtest_qmp(global_qtest, "{'execute': 'system_reset'}");
-    g_assert_false(qdict_haskey(r, "error"));
-    qobject_unref(r);
-}
-
 static void test_idr_reset_value(void)
 {
     /*
@@ -199,7 +206,7 @@ static void test_idr_reset_value(void)
     gpio_writel(GPIO_H, OTYPER, 0xDEADBEEF);
     gpio_writel(GPIO_H, PUPDR, 0xDEADBEEF);
 
-    system_reset();
+    qtest_system_reset(global_qtest);
 
     uint32_t moder = gpio_readl(GPIO_A, MODER);
     uint32_t odr = gpio_readl(GPIO_A, ODR);
@@ -269,11 +276,11 @@ static void test_gpio_output_mode(const void *data)
      * Additionally, it checks that values written to ODR
      * when not in output mode are stored and not discarded.
      */
-    unsigned int pin = ((uint64_t)data) & 0xF;
-    uint32_t gpio = ((uint64_t)data) >> 32;
+    unsigned int pin = test_pin(data);
+    uint32_t gpio = test_gpio_addr(data);
     unsigned int gpio_id = get_gpio_id(gpio);
 
-    qtest_irq_intercept_in(global_qtest, "/machine/soc/syscfg");
+    qtest_irq_intercept_in(global_qtest, SYSCFG);
 
     /* Set a bit in ODR and check nothing happens */
     gpio_set_bit(gpio, ODR, pin, 1);
@@ -304,11 +311,11 @@ static void test_gpio_input_mode(const void *data)
      * corresponding GPIO line high/low : it should set the
      * right bit in IDR and send an irq to syscfg.
      */
-    unsigned int pin = ((uint64_t)data) & 0xF;
-    uint32_t gpio = ((uint64_t)data) >> 32;
+    unsigned int pin = test_pin(data);
+    uint32_t gpio = test_gpio_addr(data);
     unsigned int gpio_id = get_gpio_id(gpio);
 
-    qtest_irq_intercept_in(global_qtest, "/machine/soc/syscfg");
+    qtest_irq_intercept_in(global_qtest, SYSCFG);
 
     /* Configure a line as input, raise it, and check that the pin is high */
     gpio_set_2bits(gpio, MODER, pin, MODER_INPUT);
@@ -333,11 +340,11 @@ static void test_pull_up_pull_down(const void *data)
      * Test that a floating pin with pull-up sets the pin
      * high and vice-versa.
      */
-    unsigned int pin = ((uint64_t)data) & 0xF;
-    uint32_t gpio = ((uint64_t)data) >> 32;
+    unsigned int pin = test_pin(data);
+    uint32_t gpio = test_gpio_addr(data);
     unsigned int gpio_id = get_gpio_id(gpio);
 
-    qtest_irq_intercept_in(global_qtest, "/machine/soc/syscfg");
+    qtest_irq_intercept_in(global_qtest, SYSCFG);
 
     /* Configure a line as input with pull-up, check the line is set high */
     gpio_set_2bits(gpio, MODER, pin, MODER_INPUT);
@@ -363,11 +370,11 @@ static void test_push_pull(const void *data)
      * disconnects the pin, that the pin can't be set or reset
      * externally afterwards.
      */
-    unsigned int pin = ((uint64_t)data) & 0xF;
-    uint32_t gpio = ((uint64_t)data) >> 32;
+    unsigned int pin = test_pin(data);
+    uint32_t gpio = test_gpio_addr(data);
     uint32_t gpio2 = GPIO_BASE_ADDR + (GPIO_H - gpio);
 
-    qtest_irq_intercept_in(global_qtest, "/machine/soc/syscfg");
+    qtest_irq_intercept_in(global_qtest, SYSCFG);
 
     /* Setting a line high externally, configuring it in push-pull output */
     /* And checking the pin was disconnected */
@@ -410,11 +417,11 @@ static void test_open_drain(const void *data)
      * However a pin set low externally shouldn't be disconnected,
      * and it can be set low externally when in open-drain mode.
      */
-    unsigned int pin = ((uint64_t)data) & 0xF;
-    uint32_t gpio = ((uint64_t)data) >> 32;
+    unsigned int pin = test_pin(data);
+    uint32_t gpio = test_gpio_addr(data);
     uint32_t gpio2 = GPIO_BASE_ADDR + (GPIO_H - gpio);
 
-    qtest_irq_intercept_in(global_qtest, "/machine/soc/syscfg");
+    qtest_irq_intercept_in(global_qtest, SYSCFG);
 
     /* Setting a line high externally, configuring it in open-drain output */
     /* And checking the pin was disconnected */
@@ -466,8 +473,8 @@ static void test_bsrr_brr(const void *data)
      * has the desired effect on ODR.
      * In BSRR, BSx has priority over BRx.
      */
-    unsigned int pin = ((uint64_t)data) & 0xF;
-    uint32_t gpio = ((uint64_t)data) >> 32;
+    unsigned int pin = test_pin(data);
+    uint32_t gpio = test_gpio_addr(data);
 
     gpio_writel(gpio, BSRR, (1 << pin));
     g_assert_cmphex(gpio_readl(gpio, ODR), ==, reset(gpio, ODR) | (1 << pin));
@@ -491,6 +498,26 @@ static void test_bsrr_brr(const void *data)
     gpio_writel(gpio, ODR, reset(gpio, ODR));
 }
 
+static void test_clock_enable(void)
+{
+    /*
+     * For each GPIO, enable its clock in RCC
+     * and check that its clock period changes to SYSCLK_PERIOD
+     */
+    unsigned int gpio_id;
+
+    for (uint32_t gpio = GPIO_A; gpio <= GPIO_H; gpio += GPIO_B - GPIO_A) {
+        gpio_id = get_gpio_id(gpio);
+        g_autofree char *path = g_strdup_printf("/machine/soc/gpio%c/clk",
+                                                gpio_id + 'a');
+        g_assert_cmpuint(get_clock_period(global_qtest, path), ==, 0);
+        /* Enable the gpio clock */
+        writel(RCC_AHB2ENR, readl(RCC_AHB2ENR) | (0x1 << gpio_id));
+        g_assert_cmpuint(get_clock_period(global_qtest, path), ==,
+                         SYSCLK_PERIOD);
+    }
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -507,41 +534,43 @@ int main(int argc, char **argv)
      * is problematic since the pin was already high.
      */
     qtest_add_data_func("stm32l4x5/gpio/test_gpioc5_output_mode",
-                        (void *)((uint64_t)GPIO_C << 32 | 5),
+                        test_data(GPIO_C, 5),
                         test_gpio_output_mode);
     qtest_add_data_func("stm32l4x5/gpio/test_gpioh3_output_mode",
-                        (void *)((uint64_t)GPIO_H << 32 | 3),
+                        test_data(GPIO_H, 3),
                         test_gpio_output_mode);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_input_mode1",
-                        (void *)((uint64_t)GPIO_D << 32 | 6),
+                        test_data(GPIO_D, 6),
                         test_gpio_input_mode);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_input_mode2",
-                        (void *)((uint64_t)GPIO_C << 32 | 10),
+                        test_data(GPIO_C, 10),
                         test_gpio_input_mode);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_pull_up_pull_down1",
-                        (void *)((uint64_t)GPIO_B << 32 | 5),
+                        test_data(GPIO_B, 5),
                         test_pull_up_pull_down);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_pull_up_pull_down2",
-                        (void *)((uint64_t)GPIO_F << 32 | 1),
+                        test_data(GPIO_F, 1),
                         test_pull_up_pull_down);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_push_pull1",
-                        (void *)((uint64_t)GPIO_G << 32 | 6),
+                        test_data(GPIO_G, 6),
                         test_push_pull);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_push_pull2",
-                        (void *)((uint64_t)GPIO_H << 32 | 3),
+                        test_data(GPIO_H, 3),
                         test_push_pull);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_open_drain1",
-                        (void *)((uint64_t)GPIO_C << 32 | 4),
+                        test_data(GPIO_C, 4),
                         test_open_drain);
     qtest_add_data_func("stm32l4x5/gpio/test_gpio_open_drain2",
-                        (void *)((uint64_t)GPIO_E << 32 | 11),
+                        test_data(GPIO_E, 11),
                         test_open_drain);
     qtest_add_data_func("stm32l4x5/gpio/test_bsrr_brr1",
-                        (void *)((uint64_t)GPIO_A << 32 | 12),
+                        test_data(GPIO_A, 12),
                         test_bsrr_brr);
     qtest_add_data_func("stm32l4x5/gpio/test_bsrr_brr2",
-                        (void *)((uint64_t)GPIO_D << 32 | 0),
+                        test_data(GPIO_D, 0),
                         test_bsrr_brr);
+    qtest_add_func("stm32l4x5/gpio/test_clock_enable",
+                   test_clock_enable);
 
     qtest_start("-machine b-l475e-iot01a");
     ret = g_test_run();

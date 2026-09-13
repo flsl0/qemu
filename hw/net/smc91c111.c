@@ -8,21 +8,34 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/net/smc91c111.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/registerfields.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-/* For crc32 */
-#include <zlib.h>
+#include <zlib.h> /* for crc32 */
 #include "qom/object.h"
 
 /* Number of 2k memory pages available.  */
 #define NUM_PACKETS 4
+/*
+ * Maximum size of a data frame, including the leading status word
+ * and byte count fields and the trailing CRC, last data byte
+ * and control byte (per figure 8-1 in the Microchip Technology
+ * LAN91C111 datasheet).
+ */
+#define MAX_PACKET_SIZE 2048
+/*
+ * Size of the non-data fields in a data frame: status word,
+ * byte count, control byte, and last data byte; this defines
+ * the smallest value the byte count in the frame can validly be.
+ */
+#define MIN_PACKET_SIZE 6
 
 #if 0
 # define logout(fmt, ...) \
@@ -251,7 +264,7 @@ struct smc91c111_state {
     int tx_fifo_done_len;
     int tx_fifo_done[NUM_PACKETS];
     /* Packet buffer memory.  */
-    uint8_t data[NUM_PACKETS][2048];
+    uint8_t data[NUM_PACKETS][MAX_PACKET_SIZE];
     uint8_t int_level;
     uint8_t int_mask;
     MemoryRegion mmio;
@@ -279,7 +292,8 @@ static const VMStateDescription vmstate_smc91c111 = {
         VMSTATE_INT32_ARRAY(rx_fifo, smc91c111_state, NUM_PACKETS),
         VMSTATE_INT32(tx_fifo_done_len, smc91c111_state),
         VMSTATE_INT32_ARRAY(tx_fifo_done, smc91c111_state, NUM_PACKETS),
-        VMSTATE_BUFFER_UNSAFE(data, smc91c111_state, 0, NUM_PACKETS * 2048),
+        VMSTATE_BUFFER_UNSAFE(data, smc91c111_state, 0,
+                              NUM_PACKETS * MAX_PACKET_SIZE),
         VMSTATE_UINT8(int_level, smc91c111_state),
         VMSTATE_UINT8(int_mask, smc91c111_state),
         VMSTATE_END_OF_LIST()
@@ -318,101 +332,16 @@ static const VMStateDescription vmstate_smc91c111 = {
 #define RS_TOOSHORT     0x0400
 #define RS_MULTICAST    0x0001
 
-static void mii_write(MII *mii, uint32_t value)
+FIELD(PTR, PTR, 0, 11)
+FIELD(PTR, NOT_EMPTY, 11, 1)
+FIELD(PTR, RESERVED, 12, 1)
+FIELD(PTR, READ, 13, 1)
+FIELD(PTR, AUTOINCR, 14, 1)
+FIELD(PTR, RCV, 15, 1)
+
+static inline bool packetnum_valid(int packet_num)
 {
-/*
-A timing diagram for a Ml serial port frame is shown in Figure 7.1. The Ml serial port is idle when at
-least 32 continuous 1's are detected on MDIO and remains idle as long as continuous 1's are detected.
-During idle, MDIO is in the high impedance state. When the Ml serial port is in the idle state, a 01
-pattern on the MDIO initiates a serial shift cycle. Data on MDIO is then shifted in on the next 14 rising
-edges of MDC (MDIO is high impedance). If the register access mode is not enabled, on the next 16
-rising edges of MDC, data is either shifted in or out on MDIO, depending on whether a write or read
-cycle was selected with the bits READ and WRITE. After the 32 MDC cycles have been completed,
-one complete register has been read/written, the serial shift process is halted, data is latched into the
-device, and MDIO goes into high impedance state. Another serial shift cycle cannot be initiated until
-the idle condition (at least 32 continuous 1's) is detected.
-*/
-    bool clock = !mii->mclk && (value & 4);
-
-    assert((value & 0xfffffff0) == 0x30);
-
-    if (clock) {
-        /* Raising clock. */
-        mii->mdi = value & MII_MDI;
-        mii->mdoe = value & MII_MDOE;
-        mii->mdo = value & MII_MDO;
-        mii->data = (mii->data << 1) + (value & 1);
-        logout("%u%u%u%u %08x\n",
-               mii->mdoe ? 1 : 0, mii->mclk ? 1 : 0,
-               mii->mdi ? 1 : 0, mii->mdo ? 1 : 0,
-               mii->data);
-        switch (mii->status) {
-            case MII_WAITING:
-                if (mii->data == 0xffffffff) {
-                    logout("mii is idle\n");
-                    mii->mdi = MII_MDI;
-                    mii->status = MII_IDLE;
-                }
-                break;
-            case MII_IDLE:
-                if (mii->data == 0xfffffffd) {
-                    logout("mii got start bit pattern 01\n");
-                    mii->status = MII_GOT_START;
-                }
-                break;
-            case MII_GOT_START:
-                if ((mii->data & 0xffffc000) == 0xffff4000) {
-                    unsigned op = (mii->data >> 12) & 0x3;
-                    unsigned phy = (mii->data >> 7) & 0x1f;
-                    unsigned reg = (mii->data >> 2) & 0x1f;
-                    logout("mii got 14 bits (op=%u, phy=%u, reg=%u, ta=%u)\n",
-                           op, phy, reg, mii->data & 0x3);
-                    mii->reg = reg;
-                    if (phy != 0) {
-                        logout("Wrong phy %u, wait for idle\n", phy);
-                        mii->status = MII_WAITING;
-                    } else if (reg >= ARRAY_SIZE(mii->regs)) {
-                        logout("Wrong reg %u, wait for idle\n", reg);
-                        mii->status = MII_WAITING;
-                    } else if (op == 1) {
-                        mii->status = MII_WRITE;
-                    } else if (op == 2) {
-                        mii->data = mii->regs[reg];
-                        mii->mdi = 0;
-                        mii->status = MII_READ;
-                    } else {
-                        logout("Illegal MII operation %u, wait for idle\n", op);
-                        mii->status = MII_WAITING;
-                    }
-                }
-                break;
-            case MII_WRITE:
-                if ((mii->data & 0xc0000000) == 0x40000000) {
-                    uint16_t data = mii->data & 0xffff;
-                    logout("mii wrote 16 bits (data=0x%04x=%u)\n", data, data);
-                    mii->regs[mii->reg] = data;
-                    mii->status = MII_WAITING;
-                }
-                break;
-            case MII_READ:
-                if ((mii->data & 0x0000ffff) == 0x0000ffff) {
-                    logout("mii read 16 bits\n");
-                    mii->mdi = MII_MDI;
-                    mii->status = MII_WAITING;
-                } else {
-                    mii->data |= 1;
-                    mii->mdi = (mii->data & 0x00010000) ? MII_MDI : 0;
-                }
-                break;
-        }
-    } /* clock */
-    mii->mclk = value & MII_MCLK;
-    //~ assert(mii->mdoe);
-}
-
-static void mii_reset(MII *mii)
-{
-    memcpy(mii->regs, mii_regs_default, sizeof(mii->regs));
+    return packet_num >= 0 && packet_num < NUM_PACKETS;
 }
 
 /* Update interrupt status.  */
@@ -479,6 +408,15 @@ static void smc91c111_pop_rx_fifo(smc91c111_state *s)
 {
     int i;
 
+    if (s->rx_fifo_len == 0) {
+        /*
+         * The datasheet doesn't document what the behaviour is if the
+         * guest tries to pop an empty RX FIFO, and there's no obvious
+         * error status register to report it. Just ignore the attempt.
+         */
+        return;
+    }
+
     s->rx_fifo_len--;
     if (s->rx_fifo_len) {
         for (i = 0; i < s->rx_fifo_len; i++)
@@ -506,10 +444,31 @@ static void smc91c111_pop_tx_fifo_done(smc91c111_state *s)
 /* Release the memory allocated to a packet.  */
 static void smc91c111_release_packet(smc91c111_state *s, int packet)
 {
+    if (!packetnum_valid(packet)) {
+        /*
+         * Data sheet doesn't document behaviour in this guest error
+         * case, and there is no error status register to report it.
+         * Log and ignore the attempt.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "smc91c111: attempt to release invalid packet %d\n",
+                      packet);
+        return;
+    }
     s->allocated &= ~(1 << packet);
     if (s->tx_alloc == 0x80)
         smc91c111_tx_alloc(s);
     smc91c111_flush_queued_packets(s);
+}
+
+static void smc91c111_complete_tx_packet(smc91c111_state *s, int packetnum)
+{
+    if (s->ctr & CTR_AUTO_RELEASE) {
+        /* Race?  */
+        smc91c111_release_packet(s, packetnum);
+    } else if (s->tx_fifo_done_len < NUM_PACKETS) {
+        s->tx_fifo_done[s->tx_fifo_done_len++] = packetnum;
+    }
 }
 
 /* Flush the TX FIFO.  */
@@ -527,13 +486,32 @@ static void smc91c111_do_tx(smc91c111_state *s)
         return;
     for (i = 0; i < s->tx_fifo_len; i++) {
         packetnum = s->tx_fifo[i];
+        /* queue_tx checked the packet number was valid */
+        assert(packetnum_valid(packetnum));
         p = &s->data[packetnum][0];
         /* Set status word.  */
         *(p++) = 0x01;
         *(p++) = 0x40;
         len = *(p++);
         len |= ((int)*(p++)) << 8;
-        len -= 6;
+        if (len < MIN_PACKET_SIZE || len > MAX_PACKET_SIZE) {
+            /*
+             * Datasheet doesn't say what to do here, and there is no
+             * relevant tx error condition listed. Log, and drop the packet.
+             */
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "smc91c111: tx packet with bad length %d, dropping\n",
+                          len);
+            smc91c111_complete_tx_packet(s, packetnum);
+            continue;
+        }
+        /*
+         * Convert from size of the data frame to number of bytes of
+         * actual packet data. Whether the "last data byte" field is
+         * included in the packet depends on the ODD bit in the control
+         * byte at the end of the frame.
+         */
+        len -= MIN_PACKET_SIZE;
         control = p[len + 1];
         if (control & 0x20)
             len++;
@@ -561,11 +539,7 @@ static void smc91c111_do_tx(smc91c111_state *s)
             }
         }
 #endif
-        if (s->ctr & CTR_AUTO_RELEASE)
-            /* Race?  */
-            smc91c111_release_packet(s, packetnum);
-        else if (s->tx_fifo_done_len < NUM_PACKETS)
-            s->tx_fifo_done[s->tx_fifo_done_len++] = packetnum;
+        smc91c111_complete_tx_packet(s, packetnum);
         qemu_send_packet(qemu_get_queue(s->nic), p, len);
     }
     s->tx_fifo_len = 0;
@@ -575,6 +549,17 @@ static void smc91c111_do_tx(smc91c111_state *s)
 /* Add a packet to the TX FIFO.  */
 static void smc91c111_queue_tx(smc91c111_state *s, int packet)
 {
+    if (!packetnum_valid(packet)) {
+        /*
+         * Datasheet doesn't document behaviour in this error case, and
+         * there's no error status register we could report it in.
+         * Log and ignore.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "smc91c111: attempt to queue invalid packet %d\n",
+                      packet);
+        return;
+    }
     if (s->tx_fifo_len == NUM_PACKETS)
         return;
     s->tx_fifo[s->tx_fifo_len++] = packet;
@@ -606,6 +591,49 @@ static void smc91c111_reset(DeviceState *dev)
 
 #define SET_LOW(name, val) s->name = (s->name & 0xff00) | val
 #define SET_HIGH(name, val) s->name = (s->name & 0xff) | (val << 8)
+
+/*
+ * The pointer register's pointer is an 11 bit value (so it exactly
+ * indexes a 2048-byte data frame). Add the specified offset to it,
+ * wrapping around at the 2048 byte mark, and return the resulting
+ * wrapped value. There are flag bits in the top part of the register,
+ * but we can ignore them here as the mask will mask them out.
+ */
+static int ptr_reg_add(smc91c111_state *s, int offset)
+{
+    return (s->ptr + offset) & R_PTR_PTR_MASK;
+}
+
+/*
+ * For an access to the Data Register at @offset, return the
+ * required offset into the packet's data frame. This will
+ * perform the pointer register autoincrement if required, and
+ * guarantees to return an in-bounds offset.
+ */
+static int data_reg_ptr(smc91c111_state *s, int offset)
+{
+    int p;
+
+    if (s->ptr & R_PTR_AUTOINCR_MASK) {
+        /*
+         * Autoincrement: use the current pointer value, and
+         * increment the pointer register's pointer field.
+         */
+        p = FIELD_EX32(s->ptr, PTR, PTR);
+        s->ptr = FIELD_DP32(s->ptr, PTR, PTR, ptr_reg_add(s, 1));
+    } else {
+        /*
+         * No autoincrement: register offset determines which
+         * byte we're addressing. Setting the pointer to the top
+         * of the data buffer and then using the pointer wrapping
+         * to read the bottom byte of the buffer is not something
+         * sensible guest software will do, but the datasheet
+         * doesn't say what the behaviour is, so we don't forbid it.
+         */
+        p = ptr_reg_add(s, offset & 3);
+    }
+    return p;
+}
 
 static void smc91c111_writeb(void *opaque, hwaddr offset,
                              uint32_t value)
@@ -752,12 +780,14 @@ static void smc91c111_writeb(void *opaque, hwaddr offset,
                     n = s->rx_fifo[0];
                 else
                     n = s->packet_num;
-                p = s->ptr & 0x07ff;
-                if (s->ptr & 0x4000) {
-                    s->ptr = (s->ptr & 0xf800) | ((s->ptr + 1) & 0x7ff);
-                } else {
-                    p += (offset & 3);
+                if (!packetnum_valid(n)) {
+                    /* Datasheet doesn't document what to do here */
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "smc91c111: attempt to write data to invalid packet %d\n",
+                                  n);
+                    return;
                 }
+                p = data_reg_ptr(s, offset);
                 s->data[n][p] = value;
             }
             return;
@@ -917,12 +947,14 @@ static uint32_t smc91c111_readb(void *opaque, hwaddr offset)
                     n = s->rx_fifo[0];
                 else
                     n = s->packet_num;
-                p = s->ptr & 0x07ff;
-                if (s->ptr & 0x4000) {
-                    s->ptr = (s->ptr & 0xf800) | ((s->ptr + 1) & 0x07ff);
-                } else {
-                    p += (offset & 3);
+                if (!packetnum_valid(n)) {
+                    /* Datasheet doesn't document what to do here */
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "smc91c111: attempt to read data from invalid packet %d\n",
+                                  n);
+                    return 0;
                 }
+                p = data_reg_ptr(s, offset);
                 return s->data[n][p];
             }
         case 12: /* Interrupt status.  */
@@ -1024,13 +1056,16 @@ static ssize_t smc91c111_receive(NetClientState *nc, const uint8_t *buf, size_t 
     if (crc)
         packetsize += 4;
     /* TODO: Flag overrun and receive errors.  */
-    if (packetsize > 2048)
+    if (packetsize > MAX_PACKET_SIZE) {
         return -1;
+    }
     packetnum = smc91c111_allocate_packet(s);
     if (packetnum == 0x80)
         return -1;
     s->rx_fifo[s->rx_fifo_len++] = packetnum;
 
+    /* allocate_packet() will not hand us back an invalid packet number */
+    assert(packetnum_valid(packetnum));
     p = &s->data[packetnum][0];
     /* ??? Multicast packets?  */
     status = 0;
@@ -1115,17 +1150,16 @@ static void smc91c111_realize(DeviceState *dev, Error **errp)
     /* ??? Save/restore.  */
 }
 
-static Property smc91c111_properties[] = {
+static const Property smc91c111_properties[] = {
     DEFINE_NIC_PROPERTIES(smc91c111_state, conf),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void smc91c111_class_init(ObjectClass *klass, void *data)
+static void smc91c111_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = smc91c111_realize;
-    dc->reset = smc91c111_reset;
+    device_class_set_legacy_reset(dc, smc91c111_reset);
     dc->vmsd = &vmstate_smc91c111;
     device_class_set_props(dc, smc91c111_properties);
 }

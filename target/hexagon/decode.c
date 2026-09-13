@@ -26,14 +26,6 @@
 
 #define fZXTN(N, M, VAL) ((VAL) & ((1LL << (N)) - 1))
 
-enum {
-    EXT_IDX_noext = 0,
-    EXT_IDX_noext_AFTER = 4,
-    EXT_IDX_mmvec = 4,
-    EXT_IDX_mmvec_AFTER = 8,
-    XX_LAST_EXT_IDX
-};
-
 /*
  *  Certain operand types represent a non-contiguous set of values.
  *  For example, the compound compare-and-jump instruction can only access
@@ -115,22 +107,13 @@ static void
 decode_fill_newvalue_regno(Packet *packet)
 {
     int i, use_regidx, offset, def_idx, dst_idx;
-    uint16_t def_opcode, use_opcode;
-    char *dststr;
 
     for (i = 1; i < packet->num_insns; i++) {
         if (GET_ATTRIB(packet->insn[i].opcode, A_DOTNEWVALUE) &&
             !GET_ATTRIB(packet->insn[i].opcode, A_EXTENSION)) {
-            use_opcode = packet->insn[i].opcode;
 
-            /* It's a store, so we're adjusting the Nt field */
-            if (GET_ATTRIB(use_opcode, A_STORE)) {
-                use_regidx = strchr(opcode_reginfo[use_opcode], 't') -
-                    opcode_reginfo[use_opcode];
-            } else {    /* It's a Jump, so we're adjusting the Ns field */
-                use_regidx = strchr(opcode_reginfo[use_opcode], 's') -
-                    opcode_reginfo[use_opcode];
-            }
+            g_assert(packet->insn[i].new_read_idx != -1);
+            use_regidx = packet->insn[i].new_read_idx;
 
             /*
              * What's encoded at the N-field is the offset to who's producing
@@ -151,37 +134,9 @@ decode_fill_newvalue_regno(Packet *packet)
              */
             g_assert(!((def_idx < 0) || (def_idx > (packet->num_insns - 1))));
 
-            /*
-             * packet->insn[def_idx] is the producer
-             * Figure out which type of destination it produces
-             * and the corresponding index in the reginfo
-             */
-            def_opcode = packet->insn[def_idx].opcode;
-            dststr = strstr(opcode_wregs[def_opcode], "Rd");
-            if (dststr) {
-                dststr = strchr(opcode_reginfo[def_opcode], 'd');
-            } else {
-                dststr = strstr(opcode_wregs[def_opcode], "Rx");
-                if (dststr) {
-                    dststr = strchr(opcode_reginfo[def_opcode], 'x');
-                } else {
-                    dststr = strstr(opcode_wregs[def_opcode], "Re");
-                    if (dststr) {
-                        dststr = strchr(opcode_reginfo[def_opcode], 'e');
-                    } else {
-                        dststr = strstr(opcode_wregs[def_opcode], "Ry");
-                        if (dststr) {
-                            dststr = strchr(opcode_reginfo[def_opcode], 'y');
-                        } else {
-                            g_assert_not_reached();
-                        }
-                    }
-                }
-            }
-            g_assert(dststr != NULL);
-
             /* Now patch up the consumer with the register number */
-            dst_idx = dststr - opcode_reginfo[def_opcode];
+            g_assert(packet->insn[def_idx].dest_idx != -1);
+            dst_idx = packet->insn[def_idx].dest_idx;
             packet->insn[i].regno[use_regidx] =
                 packet->insn[def_idx].regno[dst_idx];
             /*
@@ -273,9 +228,9 @@ static void decode_set_insn_attr_fields(Packet *pkt)
             if (GET_ATTRIB(opcode, A_SCALAR_STORE) &&
                 !GET_ATTRIB(opcode, A_MEMSIZE_0B)) {
                 if (pkt->insn[i].slot == 0) {
-                    pkt->pkt_has_store_s0 = true;
+                    pkt->pkt_has_scalar_store_s0 = true;
                 } else {
-                    pkt->pkt_has_store_s1 = true;
+                    pkt->pkt_has_scalar_store_s1 = true;
                 }
             }
         }
@@ -362,8 +317,7 @@ static void decode_shuffle_for_execution(Packet *packet)
         for (flag = false, i = 0; i < last_insn + 1; i++) {
             int opcode = packet->insn[i].opcode;
 
-            if ((strstr(opcode_wregs[opcode], "Pd4") ||
-                 strstr(opcode_wregs[opcode], "Pe4")) &&
+            if (packet->insn[i].has_pred_dest &&
                 GET_ATTRIB(opcode, A_STORE) == 0) {
                 /* This should be a compare (not a store conditional) */
                 if (flag) {
@@ -527,7 +481,8 @@ decode_insns(DisasContext *ctx, Insn *insn, uint32_t encoding)
             insn->iclass = iclass_bits(encoding);
             return 1;
         }
-        g_assert_not_reached();
+        /* Invalid non-duplex encoding */
+        return 0;
     } else {
         uint32_t iclass = get_duplex_iclass(encoding);
         unsigned int slot0_subinsn = get_slot0_subinsn(encoding);
@@ -547,8 +502,14 @@ decode_insns(DisasContext *ctx, Insn *insn, uint32_t encoding)
                 insn->iclass = iclass_bits(encoding);
                 return 2;
             }
+            /*
+             * Slot0 decode failed after slot1 succeeded. This is an invalid
+             * duplex encoding (both sub-instructions must be valid).
+             */
+            ctx->insn = --insn;
         }
-        g_assert_not_reached();
+        /* Invalid duplex encoding - return 0 to signal failure */
+        return 0;
     }
 }
 
@@ -687,6 +648,55 @@ decode_set_slot_number(Packet *pkt)
 }
 
 /*
+ * Check for GPR write conflicts in the packet.
+ * A conflict exists when a register is written by more than one instruction
+ * and at least one of those writes is unconditional.
+ *
+ * TODO: handle the more general case of any
+ * packet w/multiple-register-write operands.
+ */
+static bool pkt_has_write_conflict(Packet *pkt)
+{
+    DECLARE_BITMAP(all_dest_gprs, 32) = { 0 };
+    DECLARE_BITMAP(wreg_mult_gprs, 32) = { 0 };
+    DECLARE_BITMAP(uncond_wreg_gprs, 32) = { 0 };
+    DECLARE_BITMAP(conflict, 32);
+
+    for (int i = 0; i < pkt->num_insns; i++) {
+        Insn *insn = &pkt->insn[i];
+        int dest = insn->dest_idx;
+
+        if (dest < 0 || !insn->dest_is_gpr) {
+            continue;
+        }
+
+        int rnum = insn->regno[dest];
+        bool is_uncond = !GET_ATTRIB(insn->opcode, A_CONDEXEC);
+
+        if (test_bit(rnum, all_dest_gprs)) {
+            set_bit(rnum, wreg_mult_gprs);
+        }
+        set_bit(rnum, all_dest_gprs);
+        if (is_uncond) {
+            set_bit(rnum, uncond_wreg_gprs);
+        }
+
+        if (insn->dest_is_pair) {
+            if (test_bit(rnum + 1, all_dest_gprs)) {
+                set_bit(rnum + 1, wreg_mult_gprs);
+            }
+            set_bit(rnum + 1, all_dest_gprs);
+            if (is_uncond) {
+                set_bit(rnum + 1, uncond_wreg_gprs);
+            }
+        }
+    }
+
+    bitmap_and(conflict, wreg_mult_gprs, uncond_wreg_gprs, 32);
+    return !bitmap_empty(conflict, 32);
+}
+
+/*
  * decode_packet
  * Decodes packet with given words
  * Returns 0 on insufficient words,
@@ -705,6 +715,10 @@ int decode_packet(DisasContext *ctx, int max_words, const uint32_t *words,
 
     /* Initialize */
     memset(pkt, 0, sizeof(*pkt));
+    for (i = 0; i < INSTRUCTIONS_MAX; i++) {
+        pkt->insn[i].dest_idx = -1;
+        pkt->insn[i].new_read_idx = -1;
+    }
     /* Try to build packet */
     while (!end_of_packet && (words_read < max_words)) {
         Insn *insn = &pkt->insn[num_insns];
@@ -712,7 +726,10 @@ int decode_packet(DisasContext *ctx, int max_words, const uint32_t *words,
         encoding32 = words[words_read];
         end_of_packet = is_packet_end(encoding32);
         new_insns = decode_insns(ctx, insn, encoding32);
-        g_assert(new_insns > 0);
+        if (new_insns == 0) {
+            /* Invalid instruction encoding */
+            return 0;
+        }
         /*
          * If we saw an extender, mark next word extended so immediate
          * decode works
@@ -765,6 +782,7 @@ int decode_packet(DisasContext *ctx, int max_words, const uint32_t *words,
             /* Invalid packet */
             return 0;
         }
+        pkt->pkt_has_write_conflict = pkt_has_write_conflict(pkt);
     }
     decode_fill_newvalue_regno(pkt);
 

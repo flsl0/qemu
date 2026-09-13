@@ -28,8 +28,9 @@
 
 #define err_set(e, err, fmt, ...) {                                         \
     (e)->error_setg_win32_wrapper((e)->errp, __FILE__, __LINE__, __func__,  \
-                                   err, fmt, ## __VA_ARGS__);               \
-    qga_debug(fmt, ## __VA_ARGS__);                                         \
+                                   err, fmt ": Windows error 0x%lx",        \
+                                   ## __VA_ARGS__, err);                    \
+    qga_debug(fmt ": Windows error 0x%lx", ## __VA_ARGS__, err);            \
 }
 /* Bad idea, works only when (e)->errp != NULL: */
 #define err_is_set(e) ((e)->errp && *(e)->errp)
@@ -58,15 +59,6 @@ static struct QGAVSSContext {
 STDAPI requester_init(void)
 {
     qga_debug_begin;
-
-    COMInitializer initializer; /* to call CoInitializeSecurity */
-    HRESULT hr = CoInitializeSecurity(
-        NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
-        RPC_C_IMP_LEVEL_IDENTIFY, NULL, EOAC_NONE, NULL);
-    if (FAILED(hr)) {
-        qga_debug("failed to CoInitializeSecurity (error %lx)", hr);
-        return hr;
-    }
 
     hLib = LoadLibraryA("VSSAPI.DLL");
     if (!hLib) {
@@ -255,8 +247,8 @@ out:
     qga_debug_end;
 }
 
-DWORD get_reg_dword_value(HKEY baseKey, LPCSTR subKey, LPCSTR valueName,
-                          DWORD defaultData)
+static DWORD get_reg_dword_value(HKEY baseKey, LPCSTR subKey, LPCSTR valueName,
+                                 DWORD defaultData)
 {
     qga_debug_begin;
 
@@ -273,12 +265,12 @@ DWORD get_reg_dword_value(HKEY baseKey, LPCSTR subKey, LPCSTR valueName,
     return dwordData;
 }
 
-bool is_valid_vss_backup_type(VSS_BACKUP_TYPE vssBT)
+static bool is_valid_vss_backup_type(VSS_BACKUP_TYPE vssBT)
 {
     return (vssBT > VSS_BT_UNDEFINED && vssBT < VSS_BT_OTHER);
 }
 
-VSS_BACKUP_TYPE get_vss_backup_type(
+static VSS_BACKUP_TYPE get_vss_backup_type(
     VSS_BACKUP_TYPE defaultVssBT = DEFAULT_VSS_BACKUP_TYPE)
 {
     qga_debug_begin;
@@ -320,8 +312,6 @@ void requester_freeze(int *num_vols, void *mountpoints, ErrorSet *errset)
         return;
     }
 
-    CoInitialize(NULL);
-
     /* Allow unrestricted access to events */
     InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
     SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
@@ -348,7 +338,12 @@ void requester_freeze(int *num_vols, void *mountpoints, ErrorSet *errset)
         goto out;
     }
 
-    assert(pCreateVssBackupComponents != NULL);
+    if (!pCreateVssBackupComponents) {
+        err_set(errset, (HRESULT)ERROR_PROC_NOT_FOUND,
+                "CreateVssBackupComponents proc address absent. Did you call requester_init()?");
+        goto out;
+    }
+
     hr = pCreateVssBackupComponents(&vss_ctx.pVssbc);
     if (FAILED(hr)) {
         err_set(errset, hr, "failed to create VSS backup components");
@@ -372,8 +367,10 @@ void requester_freeze(int *num_vols, void *mountpoints, ErrorSet *errset)
      * To prevent the final commit (which requires to write to snapshots),
      * ATTR_NO_AUTORECOVERY and ATTR_TRANSPORTABLE are specified here.
      */
-    ctx = VSS_CTX_APP_ROLLBACK | VSS_VOLSNAP_ATTR_TRANSPORTABLE |
-        VSS_VOLSNAP_ATTR_NO_AUTORECOVERY | VSS_VOLSNAP_ATTR_TXF_RECOVERY;
+    ctx = VSS_CTX_APP_ROLLBACK;
+    ctx |= VSS_VOLSNAP_ATTR_TRANSPORTABLE |
+           VSS_VOLSNAP_ATTR_NO_AUTORECOVERY |
+           VSS_VOLSNAP_ATTR_TXF_RECOVERY;
     hr = vss_ctx.pVssbc->SetContext(ctx);
     if (hr == (HRESULT)VSS_E_UNSUPPORTED_CONTEXT) {
         /* Non-server version of Windows doesn't support ATTR_TRANSPORTABLE */
@@ -555,7 +552,6 @@ out:
 
 out1:
     requester_cleanup();
-    CoUninitialize();
 
     qga_debug_end;
 }
@@ -580,8 +576,16 @@ void requester_thaw(int *num_vols, void *mountpints, ErrorSet *errset)
     /* Tell the provider that the snapshot is finished. */
     SetEvent(vss_ctx.hEventThaw);
 
-    assert(vss_ctx.pVssbc);
-    assert(vss_ctx.pAsyncSnapshot);
+    if (!vss_ctx.pVssbc) {
+        err_set(errset, (HRESULT)VSS_E_BAD_STATE,
+                "CreateVssBackupComponents is missing. Did you freeze the volumes?");
+        return;
+    }
+    if (!vss_ctx.pAsyncSnapshot) {
+        err_set(errset, (HRESULT)VSS_E_BAD_STATE,
+                "AsyncSnapshot set is missing. Did you freeze the volumes?");
+        return;
+    }
 
     HRESULT hr = WaitForAsync(vss_ctx.pAsyncSnapshot);
     switch (hr) {
@@ -628,7 +632,6 @@ void requester_thaw(int *num_vols, void *mountpints, ErrorSet *errset)
     *num_vols = vss_ctx.cFrozenVols;
     requester_cleanup();
 
-    CoUninitialize();
     StopService();
 
     qga_debug_end;

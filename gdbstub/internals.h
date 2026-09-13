@@ -11,7 +11,27 @@
 
 #include "exec/cpu-common.h"
 
-#define MAX_PACKET_LENGTH 4096
+/*
+ * Most "large" transfers (e.g. memory reads, feature XML
+ * transfer) have mechanisms in the gdb protocol for splitting
+ * them. However, register values in particular cannot currently
+ * be split. This packet size must therefore be at least big enough
+ * for the worst-case register size. Currently that is Arm SME
+ * ZA storage with a 256x256 byte value. We also must account
+ * for the conversion from raw data to hex in gdb_memtohex(),
+ * which writes 2 * size bytes, and for other protocol overhead
+ * including command, register number and checksum which add
+ * another 4 bytes of overhead. However, to be consistent with
+ * the changes made in gdbserver to address this same requirement,
+ * we add a total of 32 bytes to account for protocol overhead
+ * (unclear why specifically 32 bytes), bringing the value of
+ * MAX_PACKET_LENGTH to 2 * 256 * 256 + 32 = 131104.
+ *
+ * The commit making this change for gdbserver can be found here:
+ * https://sourceware.org/git/?p=binutils-gdb.git;a=commit;h=
+ * b816042e88583f280ad186ff124ab84d31fb592b
+ */
+#define MAX_PACKET_LENGTH 131104
 
 /*
  * Shared structures and definitions
@@ -106,16 +126,14 @@ static inline int tohex(int v)
  */
 
 void gdb_put_strbuf(void);
-int gdb_put_packet(const char *buf);
 int gdb_put_packet_binary(const char *buf, int len, bool dump);
-void gdb_hextomem(GByteArray *mem, const char *buf, int len);
 void gdb_memtohex(GString *buf, const uint8_t *mem, int len);
 void gdb_memtox(GString *buf, const char *mem, int len);
 void gdb_read_byte(uint8_t ch);
 
 /*
  * Packet acknowledgement - we handle this slightly differently
- * between user and softmmu mode, mainly to deal with the differences
+ * between user and system mode, mainly to deal with the differences
  * between the flexible chardev and the direct fd approaches.
  *
  * We currently don't support a negotiated QStartNoAckMode
@@ -125,7 +143,7 @@ void gdb_read_byte(uint8_t ch);
  * gdb_got_immediate_ack() - check ok to continue
  *
  * Returns true to continue, false to re-transmit for user only, the
- * softmmu stub always returns true.
+ * system stub always returns true.
  */
 bool gdb_got_immediate_ack(void);
 /* utility helpers */
@@ -135,12 +153,12 @@ CPUState *gdb_first_attached_cpu(void);
 void gdb_append_thread_id(CPUState *cpu, GString *buf);
 int gdb_get_cpu_index(CPUState *cpu);
 unsigned int gdb_get_max_cpus(void); /* both */
-bool gdb_can_reverse(void); /* softmmu, stub for user */
+bool gdb_can_reverse(void); /* system emulation, stub for user */
 int gdb_target_sigtrap(void); /* user */
 
 void gdb_create_default_process(GDBState *s);
 
-/* signal mapping, common for softmmu, specialised for user-mode */
+/* signal mapping, common for system, specialised for user-mode */
 int gdb_signal_to_target(int sig);
 int gdb_target_signal_to_gdb(int sig);
 
@@ -157,37 +175,16 @@ void gdb_continue(void);
 int gdb_continue_partial(char *newstates);
 
 /*
- * Helpers with separate softmmu and user implementations
+ * Helpers with separate system and user implementations
  */
 void gdb_put_buffer(const uint8_t *buf, int len);
 
 /*
- * Command handlers - either specialised or softmmu or user only
+ * Command handlers - either specialised or system or user only
  */
 void gdb_init_gdbserver_state(void);
 
-typedef enum GDBThreadIdKind {
-    GDB_ONE_THREAD = 0,
-    GDB_ALL_THREADS,     /* One process, all threads */
-    GDB_ALL_PROCESSES,
-    GDB_READ_THREAD_ERR
-} GDBThreadIdKind;
-
-typedef union GdbCmdVariant {
-    const char *data;
-    uint8_t opcode;
-    unsigned long val_ul;
-    unsigned long long val_ull;
-    struct {
-        GDBThreadIdKind kind;
-        uint32_t pid;
-        uint32_t tid;
-    } thread_id;
-} GdbCmdVariant;
-
-#define get_param(p, i)    (&g_array_index(p, GdbCmdVariant, i))
-
-void gdb_handle_query_rcmd(GArray *params, void *user_ctx); /* softmmu */
+void gdb_handle_query_rcmd(GArray *params, void *ctx); /* system */
 void gdb_handle_query_offsets(GArray *params, void *user_ctx); /* user */
 void gdb_handle_query_xfer_auxv(GArray *params, void *user_ctx); /*user */
 void gdb_handle_query_xfer_siginfo(GArray *params, void *user_ctx); /*user */
@@ -201,11 +198,11 @@ void gdb_handle_query_supported_user(const char *gdb_supported); /* user */
 bool gdb_handle_set_thread_user(uint32_t pid, uint32_t tid); /* user */
 bool gdb_handle_detach_user(uint32_t pid); /* user */
 
-void gdb_handle_query_attached(GArray *params, void *user_ctx); /* both */
+void gdb_handle_query_attached(GArray *params, void *ctx); /* both */
 
-/* softmmu only */
-void gdb_handle_query_qemu_phy_mem_mode(GArray *params, void *user_ctx);
-void gdb_handle_set_qemu_phy_mem_mode(GArray *params, void *user_ctx);
+/* system only */
+void gdb_handle_query_qemu_phy_mem_mode(GArray *params, void *ctx);
+void gdb_handle_set_qemu_phy_mem_mode(GArray *params, void *ctx);
 
 /* sycall handling */
 void gdb_handle_file_io(GArray *params, void *user_ctx);
@@ -213,11 +210,11 @@ bool gdb_handled_syscall(void);
 void gdb_disable_syscalls(void);
 void gdb_syscall_reset(void);
 
-/* user/softmmu specific syscall handling */
+/* user/system specific syscall handling */
 void gdb_syscall_handling(const char *syscall_packet);
 
 /*
- * Break/Watch point support - there is an implementation for softmmu
+ * Break/Watch point support - there is an implementation for system
  * and user mode.
  */
 bool gdb_supports_guest_debug(void);
@@ -239,5 +236,15 @@ void gdb_breakpoint_remove_all(CPUState *cs);
  */
 int gdb_target_memory_rw_debug(CPUState *cs, hwaddr addr,
                                uint8_t *buf, int len, bool is_write);
+
+/**
+ * gdb_build_stop_packet() - craft the stop packet
+ * @buf: GString buffer for building the packet
+ * @cs: CPUState
+ *
+ * Craft the Stop/Reply packet when we halt.
+ */
+
+void gdb_build_stop_packet(GString *buf, CPUState *cs);
 
 #endif /* GDBSTUB_INTERNALS_H */

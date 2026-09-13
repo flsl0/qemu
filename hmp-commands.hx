@@ -764,11 +764,12 @@ SRST
 
 ERST
 
+/* BEGIN deprecated */
     {
         .name       = "wavcapture",
         .args_type  = "path:F,audiodev:s,freq:i?,bits:i?,nchannels:i?",
         .params     = "path audiodev [frequency [bits [channels]]]",
-        .help       = "capture audio to a wave file (default frequency=44100 bits=16 channels=2)",
+        .help       = "capture audio to a wave file (deprecated, default frequency=44100 bits=16 channels=2)",
         .cmd        = hmp_wavcapture,
     },
 SRST
@@ -782,13 +783,15 @@ SRST
   - Sample rate = 44100 Hz - CD quality
   - Bits = 16
   - Number of channels = 2 - Stereo
+
+  Deprecated.
 ERST
 
     {
         .name       = "stopcapture",
         .args_type  = "n:i",
         .params     = "capture index",
-        .help       = "stop capture",
+        .help       = "stop capture (deprecated)",
         .cmd        = hmp_stopcapture,
     },
 SRST
@@ -797,7 +800,9 @@ SRST
 
     info capture
 
+  Deprecated.
 ERST
+/* END deprecated */
 
     {
         .name       = "memsave",
@@ -909,26 +914,23 @@ ERST
 
     {
         .name       = "migrate",
-        .args_type  = "detach:-d,blk:-b,inc:-i,resume:-r,uri:s",
-        .params     = "[-d] [-b] [-i] [-r] uri",
+        .args_type  = "detach:-d,resume:-r,uri:s",
+        .params     = "[-d] [-r] uri",
         .help       = "migrate to URI (using -d to not wait for completion)"
-		      "\n\t\t\t -b for migration without shared storage with"
-		      " full copy of disk\n\t\t\t -i for migration without "
-		      "shared storage with incremental copy of disk "
-		      "(base image shared between src and destination)"
-                      "\n\t\t\t -r to resume a paused migration",
+		      "\n\t\t\t -r to resume a paused postcopy migration",
         .cmd        = hmp_migrate,
     },
 
 
 SRST
-``migrate [-d] [-b] [-i]`` *uri*
-  Migrate to *uri* (using -d to not wait for completion).
+``migrate [-d] [-r]`` *uri*
+  Migrate the VM to *uri*.
 
-  ``-b``
-    for migration with full copy of disk
-  ``-i``
-    for migration with incremental copy of disk (base image is shared)
+  ``-d``
+    Start the migration process, but do not wait for its completion.  To
+    query an ongoing migration process, use "info migrate".
+  ``-r``
+    Resume a paused postcopy migration.
 ERST
 
     {
@@ -1012,7 +1014,7 @@ ERST
 
     {
         .name       = "migrate_set_parameter",
-        .args_type  = "parameter:s,value:s",
+        .args_type  = "parameter:s,value:S",
         .params     = "parameter value",
         .help       = "Set the parameter for migration",
         .cmd        = hmp_migrate_set_parameter,
@@ -1290,6 +1292,9 @@ ERST
         .name       = "netdev_add",
         .args_type  = "netdev:O",
         .params     = "[user|tap|socket|stream|dgram|vde|bridge|hubport|netmap|vhost-user"
+#ifdef CONFIG_PASST
+                      "|passt"
+#endif
 #ifdef CONFIG_AF_XDP
                       "|af-xdp"
 #endif
@@ -1357,8 +1362,8 @@ ERST
     {
         .name       = "hostfwd_add",
         .args_type  = "arg1:s,arg2:s?",
-        .params     = "[netdev_id] [tcp|udp]:[hostaddr]:hostport-[guestaddr]:guestport",
-        .help       = "redirect TCP or UDP connections from host to guest (requires -net user)",
+        .params     = "[netdev_id] [tcp|udp|unix]:[[hostaddr]:hostport|hostpath]-[guestaddr]:guestport",
+        .help       = "redirect TCP, UDP or UNIX connections from host to guest (requires -net user)",
         .cmd        = hmp_hostfwd_add,
     },
 #endif
@@ -1412,7 +1417,7 @@ ERST
     {
         .name       = "watchdog_action",
         .args_type  = "action:s",
-        .params     = "[reset|shutdown|poweroff|pause|debug|none]",
+        .params     = "[reset|shutdown|poweroff|pause|debug|none|inject-nmi]",
         .help       = "change watchdog action",
         .cmd        = hmp_watchdog_action,
         .command_completion = watchdog_action_completion,

@@ -20,18 +20,17 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
-#include "disas/disas.h"
-#include "exec/exec-all.h"
+#include "exec/translation-block.h"
+#include "exec/target_page.h"
 #include "tcg/tcg-op.h"
 #include "qemu/log.h"
 #include "qemu/qemu-print.h"
 #include "exec/translator.h"
-
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
-
 #include "exec/log.h"
 #include "fpu/softfloat.h"
+#include "semihosting/semihost.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -44,9 +43,6 @@
 #include "qregs.h.inc"
 #undef DEFO32
 #undef DEFO64
-
-static TCGv_i32 cpu_halted;
-static TCGv_i32 cpu_exception_index;
 
 static char cpu_reg_names[2 * 8 * 3 + 5 * 4];
 static TCGv cpu_dregs[8];
@@ -78,14 +74,6 @@ void m68k_tcg_init(void)
 #include "qregs.h.inc"
 #undef DEFO32
 #undef DEFO64
-
-    cpu_halted = tcg_global_mem_new_i32(tcg_env,
-                                        -offsetof(M68kCPU, env) +
-                                        offsetof(CPUState, halted), "HALTED");
-    cpu_exception_index = tcg_global_mem_new_i32(tcg_env,
-                                                 -offsetof(M68kCPU, env) +
-                                                 offsetof(CPUState, exception_index),
-                                                 "EXCEPTION");
 
     p = cpu_reg_names;
     for (i = 0; i < 8; i++) {
@@ -359,7 +347,7 @@ static TCGv gen_ldst(DisasContext *s, int opsize, TCGv addr, TCGv val,
 static inline uint16_t read_im16(CPUM68KState *env, DisasContext *s)
 {
     uint16_t im;
-    im = translator_lduw(env, &s->base, s->pc);
+    im = translator_lduw_end(env, &s->base, s->pc, MO_BE);
     s->pc += 2;
     return im;
 }
@@ -724,7 +712,9 @@ static TCGv gen_lea_mode(CPUM68KState *env, DisasContext *s,
         }
         /* fallthru */
     case 2: /* Indirect register */
-        return get_areg(s, reg0);
+        tmp = tcg_temp_new();
+        tcg_gen_mov_i32(tmp, get_areg(s, reg0));
+        return tmp;
     case 4: /* Indirect predecrememnt.  */
         if (opsize == OS_UNSIZED) {
             return NULL_QREG;
@@ -751,20 +741,23 @@ static TCGv gen_lea_mode(CPUM68KState *env, DisasContext *s,
         switch (reg0) {
         case 0: /* Absolute short.  */
             offset = (int16_t)read_im16(env, s);
-            return tcg_constant_i32(offset);
+            break;
         case 1: /* Absolute long.  */
             offset = read_im32(env, s);
-            return tcg_constant_i32(offset);
+            break;
         case 2: /* pc displacement  */
             offset = s->pc;
             offset += (int16_t)read_im16(env, s);
-            return tcg_constant_i32(offset);
+            break;
         case 3: /* pc index+displacement.  */
             return gen_lea_indexed(env, s, NULL_QREG);
         case 4: /* Immediate.  */
         default:
             return NULL_QREG;
         }
+        tmp = tcg_temp_new();
+        tcg_gen_movi_i32(tmp, offset);
+        return tmp;
     }
     /* Should never happen.  */
     return NULL_QREG;
@@ -1402,6 +1395,40 @@ static void gen_jmp_tb(DisasContext *s, int n, target_ulong dest,
     }
     s->base.is_jmp = DISAS_NORETURN;
 }
+
+#ifndef CONFIG_USER_ONLY
+static bool semihosting_test(DisasContext *s)
+{
+    uint32_t test;
+
+    if (!semihosting_enabled(IS_USER(s))) {
+        return false;
+    }
+
+    /*
+     * "The semihosting instruction is immediately preceded by a
+     * nop aligned to a 4-byte boundary..."
+     * The preceding 2-byte (aligned) nop plus the 2-byte halt/bkpt
+     * means that we have advanced 4 bytes from the required nop.
+     */
+    if (s->pc % 4 != 0) {
+        return false;
+    }
+    test = translator_lduw_end(s->env, &s->base, s->pc - 4, MO_BE);
+    if (test != 0x4e71) {
+        return false;
+    }
+    /* "... and followed by an invalid sentinel instruction movec %sp,0." */
+    test = translator_ldl_end(s->env, &s->base, s->pc, MO_BE);
+    if (test != 0x4e7bf000) {
+        return false;
+    }
+
+    /* Consume the sentinel. */
+    s->pc += 4;
+    return true;
+}
+#endif /* !CONFIG_USER_ONLY */
 
 DISAS_INSN(scc)
 {
@@ -2615,6 +2642,11 @@ DISAS_INSN(bkpt)
 #if defined(CONFIG_USER_ONLY)
     gen_exception(s, s->base.pc_next, EXCP_DEBUG);
 #else
+    /* BKPT #0 is the alternate semihosting instruction. */
+    if ((insn & 7) == 0 && semihosting_test(s)) {
+        gen_exception(s, s->pc, EXCP_SEMIHOSTING);
+        return;
+    }
     gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
 #endif
 }
@@ -4207,7 +4239,7 @@ DISAS_INSN(ff1)
 
 DISAS_INSN(chk)
 {
-    TCGv src, reg;
+    TCGv src, reg, ilen;
     int opsize;
 
     switch ((insn >> 7) & 3) {
@@ -4228,13 +4260,14 @@ DISAS_INSN(chk)
     reg = gen_extend(s, DREG(insn, 9), opsize, 1);
 
     gen_flush_flags(s);
-    gen_helper_chk(tcg_env, reg, src);
+    ilen = tcg_constant_i32(s->pc - s->base.pc_next);
+    gen_helper_chk(tcg_env, reg, src, ilen);
 }
 
 DISAS_INSN(chk2)
 {
     uint16_t ext;
-    TCGv addr1, addr2, bound1, bound2, reg;
+    TCGv addr1, addr2, bound1, bound2, reg, ilen;
     int opsize;
 
     switch ((insn >> 9) & 3) {
@@ -4253,10 +4286,6 @@ DISAS_INSN(chk2)
     }
 
     ext = read_im16(env, s);
-    if ((ext & 0x0800) == 0) {
-        gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
-        return;
-    }
 
     addr1 = gen_lea(env, s, insn, OS_UNSIZED);
     addr2 = tcg_temp_new();
@@ -4273,7 +4302,12 @@ DISAS_INSN(chk2)
     }
 
     gen_flush_flags(s);
-    gen_helper_chk2(tcg_env, reg, bound1, bound2);
+    if ((ext & 0x0800) == 0) {
+        gen_helper_cmp2(tcg_env, reg, bound1, bound2);
+    } else {
+        ilen = tcg_constant_i32(s->pc - s->base.pc_next);
+        gen_helper_chk2(tcg_env, reg, bound1, bound2, ilen);
+    }
 }
 
 static void m68k_copy_line(TCGv dst, TCGv src, int index)
@@ -4467,8 +4501,13 @@ DISAS_INSN(halt)
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
     }
-
-    gen_exception(s, s->pc, EXCP_HALT_INSN);
+    if (semihosting_test(s)) {
+        gen_exception(s, s->pc, EXCP_SEMIHOSTING);
+        return;
+    }
+    tcg_gen_st_i32(tcg_constant_i32(1), tcg_env,
+                   offsetof(CPUState, halted) - offsetof(M68kCPU, env));
+    gen_exception(s, s->pc, EXCP_HLT);
 }
 
 DISAS_INSN(stop)
@@ -4483,7 +4522,8 @@ DISAS_INSN(stop)
     ext = read_im16(env, s);
 
     gen_set_sr_im(s, ext, 0);
-    tcg_gen_movi_i32(cpu_halted, 1);
+    tcg_gen_st_i32(tcg_constant_i32(1), tcg_env,
+                   offsetof(CPUState, halted) - offsetof(M68kCPU, env));
     gen_exception(s, s->pc, EXCP_HLT);
 }
 
@@ -4688,7 +4728,7 @@ static void gen_load_fcr(DisasContext *s, TCGv res, int reg)
         tcg_gen_movi_i32(res, 0);
         break;
     case M68K_FPSR:
-        tcg_gen_ld_i32(res, tcg_env, offsetof(CPUM68KState, fpsr));
+        gen_helper_get_fpsr(res, tcg_env);
         break;
     case M68K_FPCR:
         tcg_gen_ld_i32(res, tcg_env, offsetof(CPUM68KState, fpcr));
@@ -4702,7 +4742,7 @@ static void gen_store_fcr(DisasContext *s, TCGv val, int reg)
     case M68K_FPIAR:
         break;
     case M68K_FPSR:
-        tcg_gen_st_i32(val, tcg_env, offsetof(CPUM68KState, fpsr));
+        gen_helper_set_fpsr(tcg_env, val);
         break;
     case M68K_FPCR:
         gen_helper_set_fpcr(tcg_env, val);
@@ -5734,8 +5774,11 @@ void register_m68k_insns (CPUM68KState *env)
     BASE(undef,     0000, 0000);
     INSN(arith_im,  0080, fff8, CF_ISA_A);
     INSN(arith_im,  0000, ff00, M68K);
-    INSN(chk2,      00c0, f9c0, CHK2);
     INSN(bitrev,    00c0, fff8, CF_ISA_APLUSC);
+    INSN(chk2,      00d0, fff8, CHK2);
+    INSN(chk2,      00e8, fff8, CHK2);
+    INSN(chk2,      00f0, fff8, CHK2);
+    INSN(chk2,      00f8, fffc, CHK2);
     BASE(bitop_reg, 0100, f1c0);
     BASE(bitop_reg, 0140, f1c0);
     BASE(bitop_reg, 0180, f1c0);
@@ -5745,12 +5788,20 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(arith_im,  0200, ff00, M68K);
     INSN(undef,     02c0, ffc0, M68K);
     INSN(byterev,   02c0, fff8, CF_ISA_APLUSC);
+    INSN(chk2,      02d0, fff8, CHK2);
+    INSN(chk2,      02e8, fff8, CHK2);
+    INSN(chk2,      02f0, fff8, CHK2);
+    INSN(chk2,      02f8, fffc, CHK2);
     INSN(arith_im,  0480, fff8, CF_ISA_A);
     INSN(arith_im,  0400, ff00, M68K);
     INSN(undef,     04c0, ffc0, M68K);
     INSN(arith_im,  0600, ff00, M68K);
     INSN(undef,     06c0, ffc0, M68K);
     INSN(ff1,       04c0, fff8, CF_ISA_APLUSC);
+    INSN(chk2,      04d0, fff8, CHK2);
+    INSN(chk2,      04e8, fff8, CHK2);
+    INSN(chk2,      04f0, fff8, CHK2);
+    INSN(chk2,      04f8, fffc, CHK2);
     INSN(arith_im,  0680, fff8, CF_ISA_A);
     INSN(arith_im,  0c00, ff38, CF_ISA_A);
     INSN(arith_im,  0c00, ff00, M68K);
@@ -5793,7 +5844,7 @@ void register_m68k_insns (CPUM68KState *env)
     BASE(move_to_sr, 46c0, ffc0);
 #endif
     INSN(nbcd,      4800, ffc0, M68K);
-    INSN(linkl,     4808, fff8, M68K);
+    INSN(linkl,     4808, fff8, LINKL);
     BASE(pea,       4840, ffc0);
     BASE(swap,      4840, fff8);
     INSN(bkpt,      4848, fff8, BKPT);
@@ -5992,7 +6043,7 @@ static void m68k_tr_tb_start(DisasContextBase *dcbase, CPUState *cpu)
 static void m68k_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
-    tcg_gen_insn_start(dc->base.pc_next, dc->cc_op);
+    tcg_gen_insn_start(dc->base.pc_next, dc->cc_op, 0);
 }
 
 static void m68k_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
@@ -6065,24 +6116,16 @@ static void m68k_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     }
 }
 
-static void m68k_tr_disas_log(const DisasContextBase *dcbase,
-                              CPUState *cpu, FILE *logfile)
-{
-    fprintf(logfile, "IN: %s\n", lookup_symbol(dcbase->pc_first));
-    target_disas(logfile, cpu, dcbase->pc_first, dcbase->tb->size);
-}
-
 static const TranslatorOps m68k_tr_ops = {
     .init_disas_context = m68k_tr_init_disas_context,
     .tb_start           = m68k_tr_tb_start,
     .insn_start         = m68k_tr_insn_start,
     .translate_insn     = m68k_tr_translate_insn,
     .tb_stop            = m68k_tr_tb_stop,
-    .disas_log          = m68k_tr_disas_log,
 };
 
-void gen_intermediate_code(CPUState *cpu, TranslationBlock *tb, int *max_insns,
-                           vaddr pc, void *host_pc)
+void m68k_translate_code(CPUState *cpu, TranslationBlock *tb,
+                         int *max_insns, vaddr pc, void *host_pc)
 {
     DisasContext dc;
     translator_loop(cpu, tb, max_insns, pc, host_pc, &m68k_tr_ops, &dc.base);

@@ -310,7 +310,7 @@ static void xen_9pfs_bh(void *opaque)
 
 again:
     wait = ring->co != NULL && qemu_coroutine_entered(ring->co);
-    /* paired with the smb_wmb barriers in xen_9pfs_init_in_iov_from_pdu */
+    /* paired with the smp_wmb barriers in xen_9pfs_init_in_iov_from_pdu */
     smp_rmb();
     if (wait) {
         cpu_relax();
@@ -513,7 +513,7 @@ static void xen_9pfs_alloc(struct XenLegacyDevice *xendev)
     xenstore_write_be_int(xendev, "max-ring-page-order", MAX_RING_ORDER);
 }
 
-struct XenDevOps xen_9pfs_ops = {
+static const struct XenDevOps xen_9pfs_ops = {
     .size       = sizeof(Xen9pfsDev),
     .flags      = DEVOPS_FLAG_NEED_GNTDEV,
     .alloc      = xen_9pfs_alloc,
@@ -522,3 +522,9 @@ struct XenDevOps xen_9pfs_ops = {
     .disconnect = xen_9pfs_disconnect,
     .free       = xen_9pfs_free,
 };
+
+static void xen_9pfs_register_backend(void)
+{
+    xen_be_register("9pfs", &xen_9pfs_ops);
+}
+xen_backend_init(xen_9pfs_register_backend);

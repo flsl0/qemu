@@ -174,25 +174,12 @@ ERST
         .args_type  = "",
         .params     = "",
         .help       = "show PIC state",
-        .cmd        = hmp_info_pic,
+        .cmd_info_hrt = qmp_x_query_interrupt_controllers,
     },
 
 SRST
   ``info pic``
     Show PIC state.
-ERST
-
-    {
-        .name       = "rdma",
-        .args_type  = "",
-        .params     = "",
-        .help       = "show RDMA state",
-        .cmd_info_hrt = qmp_x_query_rdma,
-    },
-
-SRST
-  ``info rdma``
-    Show RDMA state.
 ERST
 
     {
@@ -269,20 +256,6 @@ SRST
     Show dynamic compiler info.
 ERST
 
-#if defined(CONFIG_TCG)
-    {
-        .name       = "opcount",
-        .args_type  = "",
-        .params     = "",
-        .help       = "show dynamic compiler opcode counters",
-    },
-#endif
-
-SRST
-  ``info opcount``
-    Show dynamic compiler opcode counters
-ERST
-
     {
         .name       = "sync-profile",
         .args_type  = "mean:-m,no_coalesce:-n,max:i?",
@@ -310,6 +283,18 @@ SRST
 ERST
 
     {
+        .name       = "accel",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show accelerator statistics",
+    },
+
+SRST
+  ``info accel``
+    Show accelerator statistics.
+ERST
+
+    {
         .name       = "kvm",
         .args_type  = "",
         .params     = "",
@@ -320,6 +305,24 @@ ERST
 SRST
   ``info kvm``
     Show KVM information.
+ERST
+
+    {
+        .name       = "accelerators",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show present and enabled information",
+        .cmd        = hmp_info_accelerators,
+    },
+
+SRST
+  ``info accelerators``
+    Show which accelerators are compiled into a QEMU binary, and what accelerator
+    is in use. For example::
+
+        kvm qtest [tcg]
+
+    indicates that TCG in use, and that KVM and qtest are also available.
 ERST
 
     {
@@ -360,18 +363,20 @@ SRST
     Show host USB devices.
 ERST
 
+/* BEGIN deprecated */
     {
         .name       = "capture",
         .args_type  = "",
         .params     = "",
-        .help       = "show capture information",
+        .help       = "show capture information (deprecated)",
         .cmd        = hmp_info_capture,
     },
 
 SRST
   ``info capture``
-    Show capture information.
+    Show capture information (deprecated).
 ERST
+/* END deprecated */
 
     {
         .name       = "snapshots",
@@ -488,9 +493,9 @@ ERST
 
     {
         .name       = "migrate",
-        .args_type  = "",
-        .params     = "",
-        .help       = "show migration status",
+        .args_type  = "all:-a",
+        .params     = "[-a]",
+        .help       = "show migration status (-a: all, dump all status)",
         .cmd        = hmp_info_migrate,
     },
 
@@ -905,7 +910,7 @@ ERST
     },
 
 SRST
-  ``stats``
+  ``info stats``
     Show runtime-collected statistics
 ERST
 
@@ -991,4 +996,17 @@ ERST
 SRST
   ``info cryptodev``
     Show the crypto devices.
+ERST
+
+    {
+        .name       = "firmware-log",
+        .args_type  = "max-size:o?",
+        .params     = "[max-size]",
+        .help       = "show the firmware (ovmf) debug log",
+        .cmd        = hmp_info_firmware_log,
+    },
+
+SRST
+  ``info firmware-log``
+    Show the firmware (ovmf) debug log.
 ERST

@@ -40,7 +40,7 @@ void write_neon_element64(TCGv_i64 src, int reg, int ele, MemOp memop);
 TCGv_i32 add_reg_for_lit(DisasContext *s, int reg, int ofs);
 void gen_set_cpsr(TCGv_i32 var, uint32_t mask);
 void gen_set_condexec(DisasContext *s);
-void gen_update_pc(DisasContext *s, target_long diff);
+void gen_update_pc(DisasContext *s, int64_t diff);
 void gen_lookup_tb(DisasContext *s);
 long vfp_reg_offset(bool dp, unsigned reg);
 long neon_full_reg_offset(unsigned reg);
@@ -81,6 +81,13 @@ void store_cpu_offset(TCGv_i32 var, int offset, int size);
                           && sizeof_field(CPUARMState, name) != 1);     \
         store_cpu_offset(val, offsetof(CPUARMState, name),              \
                          sizeof_field(CPUARMState, name));              \
+    })
+
+/* Store to the low half of a 64-bit field from a TCGv_i32 */
+#define store_cpu_field_low32(val, name)                                \
+    ({                                                                  \
+        QEMU_BUILD_BUG_ON(sizeof_field(CPUARMState, name) != 8);        \
+        store_cpu_offset(val, offsetoflow32(CPUARMState, name), 4);     \
     })
 
 #define store_cpu_field_constant(val, name) \

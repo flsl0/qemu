@@ -26,7 +26,7 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qom/object_interfaces.h"
-#include "sysemu/sysemu.h"
+#include "system/system.h"
 #include "qapi/error.h"
 #include "trace.h"
 
@@ -141,6 +141,8 @@ dbus_clipboard_qemu_request(QemuClipboardInfo *info,
     const char *mimes[] = { MIME_TEXT_PLAIN_UTF8, NULL };
     size_t n;
 
+    trace_dbus_clipboard_qemu_request(type);
+
     if (type != QEMU_CLIPBOARD_TYPE_TEXT) {
         /* unsupported atm */
         return;
@@ -189,6 +191,7 @@ static void
 dbus_clipboard_unregister_proxy(DBusDisplay *dpy)
 {
     const char *name = NULL;
+    GDBusConnection *connection = NULL;
     int i;
 
     for (i = 0; i < G_N_ELEMENTS(dpy->clipboard_request); ++i) {
@@ -198,6 +201,13 @@ dbus_clipboard_unregister_proxy(DBusDisplay *dpy)
     if (!dpy->clipboard_proxy) {
         return;
     }
+
+    connection = g_dbus_proxy_get_connection(
+        G_DBUS_PROXY(dpy->clipboard_proxy));
+    if (connection) {
+        g_signal_handlers_disconnect_by_data(connection, dpy);
+    }
+    g_signal_handlers_disconnect_by_data(dpy->clipboard_proxy, dpy);
 
     name = g_dbus_proxy_get_name(G_DBUS_PROXY(dpy->clipboard_proxy));
     trace_dbus_clipboard_unregister(name);
@@ -304,6 +314,8 @@ dbus_clipboard_grab(
     if (!dbus_clipboard_check_caller(dpy, invocation)) {
         return DBUS_METHOD_INVOCATION_HANDLED;
     }
+
+    trace_dbus_clipboard_grab(arg_selection, arg_serial);
 
     if (s >= QEMU_CLIPBOARD_SELECTION__COUNT) {
         g_dbus_method_invocation_return_error(
@@ -419,6 +431,14 @@ dbus_clipboard_request(
     }
 
     return DBUS_METHOD_INVOCATION_HANDLED;
+}
+
+void
+dbus_clipboard_fini(DBusDisplay *dpy)
+{
+    dbus_clipboard_unregister_proxy(dpy);
+    qemu_clipboard_peer_unregister(&dpy->clipboard_peer);
+    g_clear_object(&dpy->clipboard);
 }
 
 void
